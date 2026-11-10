@@ -1,0 +1,1516 @@
+
+import sqlite3
+import time
+import asyncio
+import random
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+
+# =====================================
+# SOZLAMALAR
+# =====================================
+
+TOKEN = "9292642774:AAERchfmtJLhpHYdOO64gREQWolIWd-K5mo"
+ADMIN_ID = 8952596371
+
+DB = "mesopotamiya.db"
+
+DAY = 86400
+
+START_MONEY = 10000
+START_POPULATION = 1000
+
+DAILY_INCOME = 1500
+DAILY_EXPENSE = 400
+DAILY_POPULATION = 15
+
+CITY_COST = 2500
+ARMY_COST = 1500
+ARMY_AMOUNT = 10
+ARMY_UPKEEP = 2
+
+FACTORY_COST = 4000
+RESEARCH_COST = 3000
+
+# =====================================
+# DATABASE
+# =====================================
+
+def db():
+    con = sqlite3.connect(DB)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    con = db()
+    c = con.cursor()
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS countries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_id INTEGER UNIQUE,
+        name TEXT,
+        capital TEXT,
+        flag TEXT,
+        emblem TEXT,
+        constitution TEXT,
+        money INTEGER DEFAULT 10000,
+        population INTEGER DEFAULT 1000,
+        cities INTEGER DEFAULT 1,
+        last_tick REAL,
+        created REAL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS applications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        name TEXT,
+        capital TEXT,
+        flag TEXT,
+        emblem TEXT,
+        constitution TEXT,
+        status TEXT DEFAULT 'pending'
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS diplomacy (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender INTEGER,
+        receiver INTEGER,
+        status TEXT DEFAULT 'pending'
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS treaties (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        country1 INTEGER,
+        country2 INTEGER,
+        UNIQUE(country1, country2)
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS wars (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        attacker INTEGER,
+        defender INTEGER,
+        status TEXT DEFAULT 'active',
+        created REAL
+    )
+    """)
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS daily_claims (
+        country_id INTEGER,
+        claim_day INTEGER,
+        PRIMARY KEY(country_id, claim_day)
+    )
+    """)
+
+    # Eski bazani yangilash
+    columns = [
+        x["name"] for x in
+        c.execute("PRAGMA table_info(countries)").fetchall()
+    ]
+
+    new_columns = {
+        "army": "INTEGER DEFAULT 0",
+        "defense": "INTEGER DEFAULT 0",
+        "factories": "INTEGER DEFAULT 0",
+        "technology": "INTEGER DEFAULT 1",
+        "prestige": "INTEGER DEFAULT 0",
+        "happiness": "INTEGER DEFAULT 80"
+    }
+
+    for name, definition in new_columns.items():
+        if name not in columns:
+            c.execute(
+                f"ALTER TABLE countries ADD COLUMN {name} {definition}"
+            )
+
+    con.commit()
+    con.close()
+
+
+def get_country(uid):
+    con = db()
+    row = con.execute(
+        "SELECT * FROM countries WHERE owner_id=?", (uid,)
+    ).fetchone()
+    con.close()
+    return row
+
+
+def get_country_id(cid):
+    con = db()
+    row = con.execute(
+        "SELECT * FROM countries WHERE id=?", (cid,)
+    ).fetchone()
+    con.close()
+    return row
+
+
+def get_treaty(a, b):
+    x, y = sorted((a, b))
+    con = db()
+    result = con.execute(
+        "SELECT id FROM treaties WHERE country1=? AND country2=?",
+        (x, y)
+    ).fetchone()
+    con.close()
+    return result is not None
+
+
+# =====================================
+# MENYU
+# =====================================
+
+def menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏳️ Davlatim", callback_data="my"),
+            InlineKeyboardButton("💰 Iqtisodiyot", callback_data="econ")
+        ],
+        [
+            InlineKeyboardButton("🏛 Hukumat", callback_data="gov"),
+            InlineKeyboardButton("📜 Konstitutsiya", callback_data="laws")
+        ],
+        [
+            InlineKeyboardButton("🏙 Shaharlar", callback_data="cities"),
+            InlineKeyboardButton("👥 Aholi", callback_data="people")
+        ],
+        [
+            InlineKeyboardButton("🪖 Armiya", callback_data="army"),
+            InlineKeyboardButton("🛡 Mudofaa", callback_data="defense")
+        ],
+        [
+            InlineKeyboardButton("🏭 Korxonalar", callback_data="factory"),
+            InlineKeyboardButton("🔬 Texnologiya", callback_data="research")
+        ],
+        [
+            InlineKeyboardButton("🌍 Davlatlar", callback_data="states"),
+            InlineKeyboardButton("🤝 Diplomatiya", callback_data="diplomacy")
+        ],
+        [
+            InlineKeyboardButton("⚔️ Urush", callback_data="war"),
+            InlineKeyboardButton("🎯 Vazifalar", callback_data="missions")
+        ],
+        [
+            InlineKeyboardButton("🏆 Reyting", callback_data="ranking"),
+            InlineKeyboardButton("📰 Yangiliklar", callback_data="news")
+        ],
+        [
+            InlineKeyboardButton("📊 Statistika", callback_data="stats"),
+            InlineKeyboardButton("📖 Qo'llanma", callback_data="help")
+        ]
+    ])
+
+
+# =====================================
+# YORDAM
+# =====================================
+
+async def help_command(update, context):
+    text = (
+        "🏛 MESOPOTAMIYA — O'YIN QO'LLANMASI\n\n"
+        "🌍 Bu virtual dunyoda sen mustaqil davlat rahbarisan.\n\n"
+        "1️⃣ Davlat yaratish uchun ariza topshirasan.\n"
+        "2️⃣ Admin tasdiqlagach, davlat boshqaruvini boshlaysan.\n"
+        "3️⃣ Iqtisodiyotni rivojlantirasan.\n"
+        "4️⃣ Shahar va korxonalar qurasan.\n"
+        "5️⃣ Armiya va mudofaani kuchaytirasan.\n"
+        "6️⃣ Boshqa davlatlar bilan ittifoq tuzasan.\n"
+        "7️⃣ Savdo va diplomatiya olib borasan.\n"
+        "8️⃣ Strategik urushlarda qatnashasan.\n"
+        "9️⃣ Vazifalarni bajarib mukofot olasan.\n\n"
+        "💰 Pul — davlat rivojlanishi uchun.\n"
+        "👥 Aholi — davlatning asosiy kuchi.\n"
+        "🏙 Shaharlar — iqtisodiyotning asosi.\n"
+        "🪖 Armiya — strategik kuch.\n"
+        "⭐ Obro' — davlatning xalqaro nufuzi.\n\n"
+        "⏰ Iqtisodiyot har kuni yangilanadi.\n"
+        "🎯 Kundalik vazifalar har kuni yangilanadi.\n"
+        "🏆 Reyting orqali boshqa davlatlar bilan raqobat qilasan.\n\n"
+        "Eslatma: bu xayoliy strategiya o'yini. "
+        "Barcha urushlar va natijalar o'yin ichidagi "
+        "hisob-kitob asosida amalga oshadi."
+    )
+    await update.message.reply_text(text)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    country = get_country(user.id)
+
+    if country:
+        await update.message.reply_text(
+            f"🏛 {country['name']} davlatiga xush kelibsiz!\n"
+            "Davlat boshqaruv paneli:",
+            reply_markup=menu()
+        )
+    else:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "🏳️ Davlat yaratish", callback_data="apply"
+            )],
+            [InlineKeyboardButton(
+                "📖 O'yin qo'llanmasi", callback_data="help"
+            )]
+        ])
+
+        await update.message.reply_text(
+            "🏛 MESOPOTAMIYA\n\n"
+            "🌍 Yangi dunyo seni kutmoqda!\n"
+            "O'z davlatingni yarat, iqtisodiyotingni "
+            "rivojlantir va tarixda nom qoldir!\n\n"
+            "👑 Bu dunyoda sen o'z davlating rahbarisan.",
+            reply_markup=keyboard
+        )
+
+
+async def get_id(update, context):
+    await update.message.reply_text(
+        f"Telegram ID: {update.effective_user.id}"
+    )
+
+
+# =====================================
+# DAVLAT YARATISH
+# =====================================
+
+async def apply_start(q, context):
+    uid = q.from_user.id
+
+    if get_country(uid):
+        await q.message.reply_text("Sizda davlat allaqachon mavjud.")
+        return
+
+    con = db()
+    pending = con.execute(
+        "SELECT id FROM applications "
+        "WHERE user_id=? AND status='pending'",
+        (uid,)
+    ).fetchone()
+    con.close()
+
+    if pending:
+        await q.message.reply_text(
+            "Arizangiz admin tomonidan ko'rib chiqilmoqda."
+        )
+        return
+
+    context.user_data["form"] = {}
+    context.user_data["step"] = "name"
+
+    await q.message.reply_text("🏳️ Davlat nomini yozing:")
+
+
+async def text_handler(update, context):
+    step = context.user_data.get("step")
+
+    if not step:
+        return
+
+    value = update.message.text.strip()
+
+    if not value or len(value) > 500:
+        await update.message.reply_text("Matnni qayta tekshiring.")
+        return
+
+    # Savdo uchun pul miqdori
+    if step == "trade_amount":
+        try:
+            amount = int(value)
+        except ValueError:
+            await update.message.reply_text("Faqat raqam yozing.")
+            return
+
+        target_id = context.user_data.get("trade_target")
+        country = get_country(update.effective_user.id)
+        target = get_country_id(target_id)
+
+        if not country or not target:
+            context.user_data.clear()
+            await update.message.reply_text("Davlat topilmadi.")
+            return
+
+        if amount <= 0 or amount > country["money"]:
+            await update.message.reply_text(
+                "Miqdor noto'g'ri yoki mablag' yetarli emas."
+            )
+            return
+
+        con = db()
+        con.execute(
+            "UPDATE countries SET money=money-? WHERE id=?",
+            (amount, country["id"])
+        )
+        con.execute(
+            "UPDATE countries SET money=money+? WHERE id=?",
+            (amount, target_id)
+        )
+        con.commit()
+        con.close()
+
+        context.user_data.clear()
+
+        await update.message.reply_text(
+            f"🤝 {target['name']} davlatiga "
+            f"{amount:,} pul o'tkazildi!"
+        )
+
+        try:
+            await context.bot.send_message(
+                target["owner_id"],
+                f"💰 {country['name']} davlatidan "
+                f"{amount:,} pul oldingiz!"
+            )
+        except Exception:
+            pass
+        return
+
+    form = context.user_data.get("form", {})
+
+    steps = {
+        "name": ("name", "capital", "🏙 Poytaxt nomini yozing:"),
+        "capital": ("capital", "flag", "🏳️ Bayroqni yozing:"),
+        "flag": ("flag", "emblem", "🛡 Gerbni yozing:"),
+        "emblem": (
+            "emblem", "constitution",
+            "📜 Konstitutsiyani yozing:"
+        )
+    }
+
+    if step in steps:
+        key, next_step, question = steps[step]
+        form[key] = value
+        context.user_data["step"] = next_step
+        await update.message.reply_text(question)
+        return
+
+    if step == "constitution":
+        form["constitution"] = value
+        uid = update.effective_user.id
+
+        con = db()
+        c = con.cursor()
+
+        c.execute("""
+        INSERT INTO applications
+        (user_id,name,capital,flag,emblem,constitution)
+        VALUES (?,?,?,?,?,?)
+        """, (
+            uid, form["name"], form["capital"],
+            form["flag"], form["emblem"], form["constitution"]
+        ))
+
+        app_id = c.lastrowid
+        con.commit()
+        con.close()
+
+        context.user_data.clear()
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✅ Tasdiqlash", callback_data=f"approve_{app_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Rad etish", callback_data=f"reject_{app_id}"
+            )
+        ]])
+
+        try:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"📨 YANGI DAVLAT ARIZASI\n\n"
+                f"🏳️ {form['name']}\n"
+                f"🏙 Poytaxt: {form['capital']}\n"
+                f"🏳️ Bayroq: {form['flag']}\n"
+                f"🛡 Gerb: {form['emblem']}\n"
+                f"📜 Konstitutsiya: {form['constitution']}\n"
+                f"👤 ID: {uid}",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            print("Admin xatosi:", e)
+            await update.message.reply_text(
+                "Admin xabarini yuborib bo'lmadi. "
+                "Admin botga /start yozganini tekshiring."
+            )
+            return
+
+        await update.message.reply_text(
+            "✅ Arizangiz adminga yuborildi!"
+        )
+
+
+# =====================================
+# ADMIN TASDIG'I
+# =====================================
+
+async def admin_decision(q, app_id, accepted):
+    con = db()
+    c = con.cursor()
+
+    app = c.execute(
+        "SELECT * FROM applications "
+        "WHERE id=? AND status='pending'",
+        (app_id,)
+    ).fetchone()
+
+    if not app:
+        con.close()
+        await q.message.reply_text("Ariza topilmadi.")
+        return
+
+    if accepted:
+        exists = c.execute(
+            "SELECT id FROM countries WHERE owner_id=?",
+            (app["user_id"],)
+        ).fetchone()
+
+        if exists:
+            c.execute(
+                "UPDATE applications SET status='rejected' WHERE id=?",
+                (app_id,)
+            )
+            con.commit()
+            con.close()
+            await q.edit_message_text(
+                "Bu foydalanuvchida davlat mavjud."
+            )
+            return
+
+        now = time.time()
+
+        c.execute("""
+        INSERT INTO countries (
+            owner_id,name,capital,flag,emblem,constitution,
+            money,population,cities,last_tick,created,
+            army,defense,factories,technology,prestige,happiness
+        )
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            app["user_id"], app["name"], app["capital"],
+            app["flag"], app["emblem"], app["constitution"],
+            START_MONEY, START_POPULATION, 1, now, now,
+            0, 0, 0, 1, 0, 80
+        ))
+
+        c.execute(
+            "UPDATE applications SET status='approved' WHERE id=?",
+            (app_id,)
+        )
+    else:
+        c.execute(
+            "UPDATE applications SET status='rejected' WHERE id=?",
+            (app_id,)
+        )
+
+    con.commit()
+    con.close()
+
+    await q.edit_message_text(
+        "✅ Davlat tasdiqlandi!" if accepted else "❌ Ariza rad etildi."
+    )
+
+    await q.get_bot().send_message(
+        app["user_id"],
+        "🎉 DAVLATINGIZ TASDIQLANDI!\n"
+        "Davlat boshqaruvi boshlanadi!"
+        if accepted else
+        "❌ Davlat yaratish arizangiz rad etildi.",
+        reply_markup=menu() if accepted else None
+    )
+
+
+# =====================================
+# KUNLIK IQTISODIYOT
+# =====================================
+
+async def economy_loop(app):
+    while True:
+        try:
+            now = time.time()
+            con = db()
+            c = con.cursor()
+
+            countries = c.execute(
+                "SELECT * FROM countries"
+            ).fetchall()
+
+            for country in countries:
+                last = country["last_tick"] or now
+                ticks = int((now - last) // DAY)
+
+                if ticks <= 0:
+                    continue
+
+                army = country["army"] or 0
+                factories = country["factories"] or 0
+                cities = country["cities"] or 1
+
+                income = (
+                    DAILY_INCOME
+                    + factories * 500
+                    + cities * 200
+                    + (country["technology"] or 1) * 100
+                )
+
+                expense = (
+                    DAILY_EXPENSE
+                    + army * ARMY_UPKEEP
+                    + factories * 100
+                )
+
+                new_money = country["money"] + (
+                    income - expense
+                ) * ticks
+
+                new_population = (
+                    country["population"]
+                    + DAILY_POPULATION * ticks
+                )
+
+                new_happiness = min(
+                    100, (country["happiness"] or 80) + ticks
+                )
+
+                c.execute("""
+                UPDATE countries
+                SET money=?, population=?, last_tick=?,
+                    happiness=?
+                WHERE id=?
+                """, (
+                    max(0, new_money),
+                    new_population,
+                    last + ticks * DAY,
+                    new_happiness,
+                    country["id"]
+                ))
+
+                # Tasodifiy dunyo voqealari
+                if random.random() < 0.25:
+                    event = random.choice([
+                        ("Savdo rivojlandi!", 1000),
+                        ("Yangi investorlar keldi!", 1500),
+                        ("Kichik iqtisodiy qiyinchilik.", -500),
+                        ("Xalq bayrami!", -300)
+                    ])
+
+                    c.execute(
+                        "UPDATE countries SET money=MAX(0,money+?), "
+                        "prestige=MAX(0,prestige+?) WHERE id=?",
+                        (
+                            event[1],
+                            2 if event[1] > 0 else 0,
+                            country["id"]
+                        )
+                    )
+
+            con.commit()
+            con.close()
+
+        except Exception as e:
+            print("Economy error:", e)
+
+        await asyncio.sleep(60)
+
+
+# =====================================
+# KUNLIK VAZIFALAR
+# =====================================
+
+async def daily_mission(q, country):
+    today = int(time.time() // DAY)
+
+    con = db()
+    claimed = con.execute(
+        "SELECT * FROM daily_claims "
+        "WHERE country_id=? AND claim_day=?",
+        (country["id"], today)
+    ).fetchone()
+
+    con.close()
+
+    if claimed:
+        await q.message.reply_text(
+            "🎯 Bugungi mukofotingiz allaqachon olingan.\n"
+            "Ertaga yana keling!"
+        )
+        return
+
+    reward = 2000
+
+    con = db()
+    con.execute(
+        "INSERT INTO daily_claims(country_id,claim_day) VALUES (?,?)",
+        (country["id"], today)
+    )
+    con.execute("""
+    UPDATE countries
+    SET money=money+?, prestige=prestige+5
+    WHERE id=?
+    """, (reward, country["id"]))
+    con.commit()
+    con.close()
+
+    await q.message.reply_text(
+        "🎉 KUNDALIK VAZIFA BAJARILDI!\n\n"
+        f"💰 Mukofot: +{reward:,}\n"
+        "⭐ Obro': +5\n\n"
+        "Ertaga yangi mukofot olishingiz mumkin."
+    )
+
+
+# =====================================
+# DIPLOMATIYA
+# =====================================
+
+async def diplomacy_answer(q, request_id, accepted):
+    con = db()
+    c = con.cursor()
+
+    request = c.execute(
+        "SELECT * FROM diplomacy "
+        "WHERE id=? AND status='pending'",
+        (request_id,)
+    ).fetchone()
+
+    if not request:
+        con.close()
+        await q.message.reply_text("Taklif topilmadi.")
+        return
+
+    receiver = get_country(q.from_user.id)
+
+    if not receiver or receiver["id"] != request["receiver"]:
+        con.close()
+        await q.message.reply_text("Bu taklif sizga yuborilmagan.")
+        return
+
+    c.execute(
+        "UPDATE diplomacy SET status=? WHERE id=?",
+        ("accepted" if accepted else "rejected", request_id)
+    )
+
+    if accepted:
+        a, b = sorted((request["sender"], request["receiver"]))
+        c.execute(
+            "INSERT OR IGNORE INTO treaties(country1,country2) "
+            "VALUES (?,?)",
+            (a, b)
+        )
+
+    sender = get_country_id(request["sender"])
+
+    con.commit()
+    con.close()
+
+    await q.edit_message_text(
+        "🤝 Ittifoq tuzildi!"
+        if accepted else "❌ Taklif rad etildi."
+    )
+
+    if sender:
+        try:
+            await q.get_bot().send_message(
+                sender["owner_id"],
+                "🤝 Diplomatik taklifingiz qabul qilindi!"
+                if accepted else
+                "❌ Diplomatik taklifingiz rad etildi."
+            )
+        except Exception:
+            pass
+
+
+# =====================================
+# URUSH TIZIMI
+# =====================================
+
+async def declare_war(q, context, country, target_id):
+    target = get_country_id(target_id)
+
+    if not target:
+        await q.message.reply_text("Davlat topilmadi.")
+        return
+
+    if country["id"] == target_id:
+        await q.message.reply_text("O'z davlatingizga urush e'lon qilib bo'lmaydi.")
+        return
+
+    if get_treaty(country["id"], target_id):
+        await q.message.reply_text(
+            "🤝 Bu davlat bilan ittifoq mavjud. "
+            "Avval diplomatik munosabatlarni hal qiling."
+        )
+        return
+
+    con = db()
+    active = con.execute("""
+    SELECT id FROM wars
+    WHERE status='active'
+    AND (
+        (attacker=? AND defender=?)
+        OR (attacker=? AND defender=?)
+    )
+    """, (
+        country["id"], target_id,
+        target_id, country["id"]
+    )).fetchone()
+
+    if active:
+        con.close()
+        await q.message.reply_text("Bu davlatlar orasida urush mavjud.")
+        return
+
+    if country["money"] < 1000:
+        con.close()
+        await q.message.reply_text(
+            "Urush e'lon qilish uchun kamida 1 000 pul kerak."
+        )
+        return
+
+    c = con.cursor()
+
+    c.execute("""
+    INSERT INTO wars(attacker,defender,status,created)
+    VALUES (?,?,?,?)
+    """, (country["id"], target_id, "active", time.time()))
+
+    war_id = c.lastrowid
+
+    c.execute(
+        "UPDATE countries SET money=money-1000 WHERE id=?",
+        (country["id"],)
+    )
+
+    con.commit()
+    con.close()
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "⚔️ Strategik jang natijasini hisoblash",
+            callback_data=f"resolve_{war_id}"
+        )
+    ]])
+
+    await q.message.reply_text(
+        f"⚔️ {target['name']} davlatiga urush e'lon qilindi!\n\n"
+        "Bu o'yin ichidagi strategik urush hisoblanadi.\n"
+        "Natijani hisoblash uchun tugmani bosing.",
+        reply_markup=keyboard
+    )
+
+    try:
+        await context.bot.send_message(
+            target["owner_id"],
+            f"⚔️ {country['name']} davlati sizga "
+            "urush e'lon qildi!"
+        )
+    except Exception:
+        pass
+
+
+async def resolve_war(q, war_id):
+    con = db()
+    c = con.cursor()
+
+    war = c.execute(
+        "SELECT * FROM wars WHERE id=? AND status='active'",
+        (war_id,)
+    ).fetchone()
+
+    if not war:
+        con.close()
+        await q.message.reply_text("Bu urush allaqachon yakunlangan.")
+        return
+
+    attacker = get_country_id(war["attacker"])
+    defender = get_country_id(war["defender"])
+
+    if not attacker or not defender:
+        con.close()
+        return
+
+    if q.from_user.id != attacker["owner_id"]:
+        con.close()
+        await q.answer(
+            "Natijani faqat urush e'lon qilgan davlat rahbari hisoblaydi.",
+            show_alert=True
+        )
+        return
+
+    # Faqat o'yin ichidagi abstrakt strategik hisob
+    attack_power = (
+        attacker["army"] * 10
+        + attacker["technology"] * 100
+        + random.randint(100, 500)
+    )
+
+    defense_power = (
+        defender["defense"]
+        + defender["technology"] * 100
+        + defender["cities"] * 100
+        + random.randint(100, 500)
+    )
+
+    if attack_power > defense_power:
+        winner = attacker
+        loser = defender
+        result = "🏆 G'ALABA!"
+        reward = 2000
+
+        c.execute("""
+        UPDATE countries
+        SET money=money+?, prestige=prestige+20
+        WHERE id=?
+        """, (reward, attacker["id"]))
+
+        c.execute("""
+        UPDATE countries
+        SET happiness=MAX(0,happiness-5)
+        WHERE id=?
+        """, (defender["id"],))
+
+    else:
+        winner = defender
+        loser = attacker
+        result = "🛡 MUDOFAA MUVAFFAQIYATLI!"
+        reward = 1000
+
+        c.execute("""
+        UPDATE countries
+        SET money=money+?, prestige=prestige+15
+        WHERE id=?
+        """, (reward, defender["id"]))
+
+    c.execute(
+        "UPDATE wars SET status='finished' WHERE id=?",
+        (war_id,)
+    )
+
+    con.commit()
+    con.close()
+
+    text = (
+        f"⚔️ URUSH YAKUNLANDI!\n\n"
+        f"🏛 {attacker['name']}\n"
+        f"🏛 {defender['name']}\n\n"
+        f"{result}\n"
+        f"👑 G'olib: {winner['name']}\n"
+        f"💰 Mukofot: {reward:,}\n"
+        f"📉 Mag'lub: {loser['name']}\n\n"
+        "Bu natija o'yin ichidagi strategik "
+        "ko'rsatkichlarga asoslangan."
+    )
+
+    await q.edit_message_text(text)
+
+    try:
+        await q.get_bot().send_message(
+            loser["owner_id"],
+            f"⚔️ {winner['name']} bilan strategik "
+            "urush yakunlandi. Bu safar mag'lub bo'ldingiz."
+        )
+    except Exception:
+        pass
+
+
+# =====================================
+# ASOSIY TUGMALAR
+# =====================================
+
+async def buttons(update, context):
+    q = update.callback_query
+    await q.answer()
+
+    data = q.data
+    uid = q.from_user.id
+
+    if data == "help":
+        await q.message.reply_text(
+            "📖 MESOPOTAMIYA QO'LLANMASI\n\n"
+            "🏛 Davlatingizni yarating.\n"
+            "💰 Iqtisodiyotni rivojlantiring.\n"
+            "🏭 Korxonalar quring.\n"
+            "🔬 Texnologiyani oshiring.\n"
+            "🤝 Ittifoq tuzing.\n"
+            "⚔️ Strategik urushlarda qatnashing.\n"
+            "🎯 Kundalik vazifalarni bajaring.\n"
+            "🏆 Reytingda yuqoriga chiqing.\n\n"
+            "Har bir qaroringiz davlat kelajagiga ta'sir qiladi."
+        )
+        return
+
+    if data == "apply":
+        await apply_start(q, context)
+        return
+
+    if data.startswith(("approve_", "reject_")):
+        if uid != ADMIN_ID:
+            await q.answer("Faqat admin!", show_alert=True)
+            return
+
+        app_id = int(data.rsplit("_", 1)[1])
+        await admin_decision(
+            q, app_id, data.startswith("approve_")
+        )
+        return
+
+    if data.startswith(("dip_yes_", "dip_no_")):
+        await diplomacy_answer(
+            q,
+            int(data.rsplit("_", 1)[1]),
+            data.startswith("dip_yes_")
+        )
+        return
+
+    if data.startswith("resolve_"):
+        await resolve_war(
+            q, int(data.rsplit("_", 1)[1])
+        )
+        return
+
+    country = get_country(uid)
+
+    if not country:
+        await q.message.reply_text(
+            "Avval davlat yaratish uchun ariza yuboring."
+        )
+        return
+
+    if data == "my":
+        await q.message.reply_text(
+            f"🏛 {country['name']}\n"
+            f"{country['flag']}\n"
+            f"🏙 Poytaxt: {country['capital']}\n"
+            f"💰 Budjet: {country['money']:,}\n"
+            f"👥 Aholi: {country['population']:,}\n"
+            f"🏙 Shaharlar: {country['cities']}\n"
+            f"🪖 Armiya: {country['army']}\n"
+            f"🏭 Korxonalar: {country['factories']}\n"
+            f"🔬 Texnologiya: {country['technology']}\n"
+            f"⭐ Obro': {country['prestige']}\n"
+            f"😊 Xalq kayfiyati: {country['happiness']}%"
+        )
+
+    elif data == "econ":
+        income = (
+            DAILY_INCOME
+            + country["factories"] * 500
+            + country["cities"] * 200
+            + country["technology"] * 100
+        )
+
+        expense = (
+            DAILY_EXPENSE
+            + country["army"] * ARMY_UPKEEP
+            + country["factories"] * 100
+        )
+
+        await q.message.reply_text(
+            "💰 IQTISODIYOT\n\n"
+            f"Xazina: {country['money']:,}\n"
+            f"Kunlik daromad: +{income:,}\n"
+            f"Kunlik xarajat: -{expense:,}\n"
+            f"Sof foyda: {income-expense:,}\n\n"
+            "Iqtisodiyot har 24 soatda yangilanadi."
+        )
+
+    elif data == "people":
+        await q.message.reply_text(
+            f"👥 Aholi: {country['population']:,}\n"
+            f"Kunlik o'sish: +{DAILY_POPULATION}\n"
+            f"Xalq kayfiyati: {country['happiness']}%"
+        )
+
+    elif data == "cities":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🏗 Shahar qurish ({CITY_COST:,})",
+                callback_data="build"
+            )
+        ]])
+
+        await q.message.reply_text(
+            f"🏙 Shaharlar: {country['cities']}\n"
+            f"Yangi shahar: {CITY_COST:,}\n"
+            "Har bir shahar kunlik daromadni oshiradi.",
+            reply_markup=keyboard
+        )
+
+    elif data == "build":
+        if country["money"] < CITY_COST:
+            await q.message.reply_text("Mablag' yetarli emas.")
+            return
+
+        con = db()
+        con.execute("""
+        UPDATE countries
+        SET money=money-?, cities=cities+1
+        WHERE owner_id=?
+        """, (CITY_COST, uid))
+        con.commit()
+        con.close()
+
+        await q.message.reply_text("🏗 Yangi shahar qurildi!")
+
+    elif data == "army":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🪖 {ARMY_AMOUNT} birlik qo'shish",
+                callback_data="recruit"
+            )
+        ]])
+
+        await q.message.reply_text(
+            f"🪖 ARMIYA\n\n"
+            f"Armiya: {country['army']}\n"
+            f"Mudofaa: {country['defense']}\n"
+            f"Yangi birlik narxi: {ARMY_COST:,}\n"
+            f"Kunlik xarajat: "
+            f"{country['army']*ARMY_UPKEEP:,}",
+            reply_markup=keyboard
+        )
+
+    elif data == "recruit":
+        if country["money"] < ARMY_COST:
+            await q.message.reply_text("Mablag' yetarli emas.")
+            return
+
+        con = db()
+        con.execute("""
+        UPDATE countries
+        SET money=money-?,
+            army=army+?,
+            defense=defense+?
+        WHERE owner_id=?
+        """, (
+            ARMY_COST, ARMY_AMOUNT,
+            ARMY_AMOUNT * 5, uid
+        ))
+        con.commit()
+        con.close()
+
+        await q.message.reply_text(
+            "🪖 Armiya kuchi oshirildi!"
+        )
+
+    elif data == "defense":
+        await q.message.reply_text(
+            f"🛡 MUDOFAA\n\n"
+            f"Armiya: {country['army']}\n"
+            f"Mudofaa kuchi: {country['defense']}\n"
+            f"Texnologiya: {country['technology']}"
+        )
+
+    elif data == "factory":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🏭 Korxona qurish ({FACTORY_COST:,})",
+                callback_data="build_factory"
+            )
+        ]])
+
+        await q.message.reply_text(
+            f"🏭 Korxonalar: {country['factories']}\n"
+            "Har bir korxona kunlik daromadni "
+            "500 ga oshiradi.\n"
+            f"Qurilish narxi: {FACTORY_COST:,}",
+            reply_markup=keyboard
+        )
+
+    elif data == "build_factory":
+        if country["money"] < FACTORY_COST:
+            await q.message.reply_text("Mablag' yetarli emas.")
+            return
+
+        con = db()
+        con.execute("""
+        UPDATE countries
+        SET money=money-?, factories=factories+1
+        WHERE owner_id=?
+        """, (FACTORY_COST, uid))
+        con.commit()
+        con.close()
+
+        await q.message.reply_text(
+            "🏭 Yangi korxona ishga tushirildi!"
+        )
+
+    elif data == "research":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                f"🔬 Texnologiyani oshirish ({RESEARCH_COST:,})",
+                callback_data="upgrade_tech"
+            )
+        ]])
+
+        await q.message.reply_text(
+            f"🔬 Texnologiya darajasi: {country['technology']}\n"
+            "Har bir daraja kunlik daromadni 100 ga oshiradi.\n"
+            f"Yangilash narxi: {RESEARCH_COST:,}",
+            reply_markup=keyboard
+        )
+
+    elif data == "upgrade_tech":
+        if country["money"] < RESEARCH_COST:
+            await q.message.reply_text("Mablag' yetarli emas.")
+            return
+
+        con = db()
+        con.execute("""
+        UPDATE countries
+        SET money=money-?, technology=technology+1
+        WHERE owner_id=?
+        """, (RESEARCH_COST, uid))
+        con.commit()
+        con.close()
+
+        await q.message.reply_text(
+            "🔬 Texnologiya darajasi oshirildi!"
+        )
+
+    elif data == "gov":
+        await q.message.reply_text(
+            "🏛 HUKUMAT\n\n"
+            f"Rahbar: {q.from_user.full_name}\n"
+            f"Davlat: {country['name']}\n"
+            f"Poytaxt: {country['capital']}\n"
+            "Barcha siyosiy qarorlar davlat rahbari tomonidan qabul qilinadi."
+        )
+
+    elif data == "laws":
+        await q.message.reply_text(
+            "📜 KONSTITUTSIYA\n\n" + country["constitution"]
+        )
+
+    elif data == "stats":
+        await q.message.reply_text(
+            f"📊 {country['name']} STATISTIKASI\n\n"
+            f"💰 Pul: {country['money']:,}\n"
+            f"👥 Aholi: {country['population']:,}\n"
+            f"🏙 Shahar: {country['cities']}\n"
+            f"🏭 Korxona: {country['factories']}\n"
+            f"🪖 Armiya: {country['army']}\n"
+            f"🛡 Mudofaa: {country['defense']}\n"
+            f"🔬 Texnologiya: {country['technology']}\n"
+            f"⭐ Obro': {country['prestige']}"
+        )
+
+    elif data == "states":
+        con = db()
+        rows = con.execute(
+            "SELECT * FROM countries ORDER BY prestige DESC"
+        ).fetchall()
+        con.close()
+
+        if not rows:
+            await q.message.reply_text("Davlatlar hali yo'q.")
+            return
+
+        text = "🌍 DUNYO DAVLATLARI\n\n"
+
+        for row in rows:
+            text += (
+                f"{row['flag']} {row['name']}\n"
+                f"🏙 {row['capital']} | "
+                f"👥 {row['population']:,}\n\n"
+            )
+
+        await q.message.reply_text(text)
+
+    elif data == "diplomacy":
+        con = db()
+        rows = con.execute(
+            "SELECT id,name FROM countries WHERE id!=?",
+            (country["id"],)
+        ).fetchall()
+        con.close()
+
+        if not rows:
+            await q.message.reply_text("Boshqa davlatlar hali yo'q.")
+            return
+
+        keyboard = [
+            [
+                InlineKeyboardButton(
+                    "🤝 " + row["name"],
+                    callback_data=f"offer_{row['id']}"
+                ),
+                InlineKeyboardButton(
+                    "💰 Savdo",
+                    callback_data=f"trade_{row['id']}"
+                )
+            ]
+            for row in rows
+        ]
+
+        await q.message.reply_text(
+            "Qaysi davlat bilan aloqa qilasiz?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("offer_"):
+        target_id = int(data.split("_")[1])
+        target = get_country_id(target_id)
+
+        if not target:
+            await q.message.reply_text("Davlat topilmadi.")
+            return
+
+        if get_treaty(country["id"], target_id):
+            await q.message.reply_text("Bu davlat bilan ittifoq mavjud.")
+            return
+
+        con = db()
+        existing = con.execute("""
+        SELECT id FROM diplomacy
+        WHERE sender=? AND receiver=? AND status='pending'
+        """, (country["id"], target_id)).fetchone()
+
+        if existing:
+            con.close()
+            await q.message.reply_text("Taklif allaqachon yuborilgan.")
+            return
+
+        c = con.cursor()
+        c.execute(
+            "INSERT INTO diplomacy(sender,receiver) VALUES (?,?)",
+            (country["id"], target_id)
+        )
+        request_id = c.lastrowid
+        con.commit()
+        con.close()
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "✅ Qabul qilish",
+                callback_data=f"dip_yes_{request_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Rad etish",
+                callback_data=f"dip_no_{request_id}"
+            )
+        ]])
+
+        try:
+            await context.bot.send_message(
+                target["owner_id"],
+                f"🤝 {country['name']} davlati ittifoq taklif qildi!",
+                reply_markup=keyboard
+            )
+            await q.message.reply_text("✅ Taklif yuborildi.")
+        except Exception:
+            await q.message.reply_text(
+                "Davlat rahbariga xabar yuborilmadi."
+            )
+
+    elif data.startswith("trade_"):
+        target_id = int(data.split("_")[1])
+        target = get_country_id(target_id)
+
+        if not target:
+            await q.message.reply_text("Davlat topilmadi.")
+            return
+
+        context.user_data["step"] = "trade_amount"
+        context.user_data["trade_target"] = target_id
+
+        await q.message.reply_text(
+            f"💰 {target['name']} davlatiga qancha pul yubormoqchisiz?\n"
+            "Pul miqdorini raqam bilan yozing:"
+        )
+
+    elif data == "war":
+        con = db()
+        rows = con.execute(
+            "SELECT id,name FROM countries WHERE id!=?",
+            (country["id"],)
+        ).fetchall()
+        con.close()
+
+        if not rows:
+            await q.message.reply_text("Urush uchun boshqa davlat yo'q.")
+            return
+
+        keyboard = [
+            [InlineKeyboardButton(
+                "⚔️ " + row["name"],
+                callback_data=f"war_target_{row['id']}"
+            )]
+            for row in rows
+        ]
+
+        await q.message.reply_text(
+            "⚔️ STRATEGIK URUSH\n\n"
+            "Davlatni tanlang. Urush o'yin ichidagi "
+            "kuch ko'rsatkichlari orqali hisoblanadi.\n"
+            "Urush e'lon qilish narxi: 1 000",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    elif data.startswith("war_target_"):
+        target_id = int(data.rsplit("_", 1)[1])
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                "⚔️ Urush e'lon qilish",
+                callback_data=f"war_confirm_{target_id}"
+            ),
+            InlineKeyboardButton(
+                "❌ Bekor qilish",
+                callback_data="war"
+            )
+        ]])
+
+        target = get_country_id(target_id)
+
+        if not target:
+            await q.message.reply_text("Davlat topilmadi.")
+            return
+
+        await q.message.reply_text(
+            f"{target['name']} davlatiga urush e'lon qilmoqchimisiz?",
+            reply_markup=keyboard
+        )
+
+    elif data.startswith("war_confirm_"):
+        target_id = int(data.rsplit("_", 1)[1])
+        await declare_war(q, context, country, target_id)
+
+    elif data == "missions":
+        await q.message.reply_text(
+            "🎯 KUNDALIK VAZIFA\n\n"
+            "Bugungi vazifangiz:\n"
+            "🏛 Davlatingizga kiring va mukofotni oling.\n\n"
+            "💰 Mukofot: 2 000\n"
+            "⭐ Obro': +5",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "🎁 Mukofotni olish",
+                    callback_data="claim"
+                )
+            ]])
+        )
+
+    elif data == "claim":
+        await daily_mission(q, country)
+
+    elif data == "ranking":
+        con = db()
+        rows = con.execute("""
+        SELECT name,flag,money,prestige,population
+        FROM countries
+        ORDER BY (prestige + money/1000 + population/1000) DESC
+        LIMIT 10
+        """).fetchall()
+        con.close()
+
+        text = "🏆 ENG KUCHLI 10 DAVLAT\n\n"
+
+        for i, row in enumerate(rows, 1):
+            text += (
+                f"{i}. {row['flag']} {row['name']}\n"
+                f"💰 {row['money']:,} | "
+                f"⭐ {row['prestige']}\n\n"
+            )
+
+        await q.message.reply_text(text)
+
+    elif data == "news":
+        con = db()
+        rows = con.execute("""
+        SELECT * FROM wars
+        ORDER BY created DESC LIMIT 5
+        """).fetchall()
+        con.close()
+
+        text = "📰 DUNYO YANGILIKLARI\n\n"
+
+        if not rows:
+            text += "Hozircha yirik voqealar yo'q.\n"
+        else:
+            for war in rows:
+                a = get_country_id(war["attacker"])
+                b = get_country_id(war["defender"])
+
+                if a and b:
+                    status = (
+                        "Davom etmoqda"
+                        if war["status"] == "active"
+                        else "Yakunlangan"
+                    )
+                    text += (
+                        f"⚔️ {a['name']} — {b['name']}\n"
+                        f"Holat: {status}\n\n"
+                    )
+
+        await q.message.reply_text(text)
+
+
+# =====================================
+# ISHGA TUSHIRISH
+# =====================================
+
+async def post_init(app):
+    app.bot_data["economy_task"] = asyncio.create_task(
+        economy_loop(app)
+    )
+
+
+async def post_shutdown(app):
+    task = app.bot_data.get("economy_task")
+
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def main():
+    if TOKEN == "TOKENINGIZNI_SHU_YERGA":
+        raise ValueError("Bot tokenini kiriting!")
+
+    init_db()
+
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("id", get_id))
+
+    app.add_handler(CallbackQueryHandler(buttons))
+
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            text_handler
+        )
+    )
+
+    print("MESOPOTAMIYA ISHLAMOQDA!")
+
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
